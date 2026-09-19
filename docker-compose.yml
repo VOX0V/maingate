@@ -1,0 +1,30 @@
+services:
+  maingate:
+    image: ghcr.io/vox0v/maingate:latest
+    container_name: MainGate
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      MOONRAKER_HOST: ${MOONRAKER_HOST}
+      MOONRAKER_PORT: ${MOONRAKER_PORT:-7125}
+      WEBCAM_HOST: ${WEBCAM_HOST:-${MOONRAKER_HOST}}
+      WEBCAM_PORT: ${WEBCAM_PORT:-8080}
+      AUTH_USER: ${AUTH_USER}
+      AUTH_PASSWORD: ${AUTH_PASSWORD}
+      CONNECTION_TYPE: ${CONNECTION_TYPE:-https}
+      BAN_THRESHOLD: ${BAN_THRESHOLD:-3}
+      BAN_DURATION_MINUTES: ${BAN_DURATION_MINUTES:-60}
+    ports:
+      - "${FLUIDD_REMOTE_PORT:-8090}:80"
+      - "${MAINSAIL_REMOTE_PORT:-8091}:81"
+    volumes:
+      - maingate_data:/data
+
+volumes:
+  maingate_data:

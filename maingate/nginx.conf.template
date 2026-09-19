@@ -1,0 +1,347 @@
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Traefik termine le HTTPS et parle en HTTP au conteneur en interne ;
+# on se base donc sur X-Forwarded-Proto (envoyé par Traefik) pour
+# reconstruire les redirections avec le bon protocole. En accès direct
+# (sans reverse proxy), cet en-tête est absent -> on retombe sur $scheme.
+map $http_x_forwarded_proto $redirect_scheme {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
+# Limite les tentatives sur /login (bruteforce) — 5 requêtes/minute par IP,
+# avec une petite marge de rafale. Partagée entre fluidd et mainsail.
+limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
+
+# Cache la version de nginx dans les en-têtes/erreurs.
+server_tokens off;
+
+server {
+    listen 80;
+    server_name _;
+
+    # Écrit sur stdout/stderr (capturés par Docker) plutôt que dans des
+    # fichiers qui grossiraient indéfiniment sur le disque de l'hôte.
+    access_log /dev/stdout;
+    error_log  /dev/stderr;
+
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Host $http_host;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_types application/json text/css application/javascript;
+
+    # Limite basse par défaut (formulaires login/admin) — les endpoints qui
+    # ont réellement besoin de gros transferts (upload de gcode via l'API
+    # Moonraker) l'élèvent explicitement ci-dessous, dans leur propre bloc.
+    client_max_body_size 1m;
+    proxy_read_timeout 3600s;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Injecte une petite barre MainGate (bas-droite, empilée verticalement :
+    # Admin/MainGate au-dessus, Déconnexion en dessous, version tout en bas)
+    # dans le HTML de Fluidd.
+    #
+    # Fluidd est une PWA : son service worker intercepte les navigations
+    # (clics sur un <a href>, changement d'URL) et sert index.html en cache
+    # pour toute route qu'il ne reconnaît pas (ex: /admin, /login) — d'où un
+    # "reload qui revient à l'accueil" plutôt qu'un vrai chargement de la
+    # page ciblée. Pour contourner ça, les boutons ne sont pas des liens :
+    # ils déclenchent un fetch() (jamais intercepté comme une navigation),
+    # récupèrent le HTML réel, puis remplacent la page nous-mêmes.
+    #
+    # Le bouton du haut change de rôle selon la page : "Admin" -> ouvre le
+    # panneau d'admin ; une fois dans le panneau, il devient "MainGate" et
+    # ramène à l'application principale, sans avoir à déplacer la souris.
+    sub_filter_types text/html;
+    sub_filter_once on;
+    sub_filter '</body>' '<style>
+#pr-toolbar{position:fixed;bottom:12px;right:12px;z-index:999999;display:flex;flex-direction:column;align-items:flex-end;gap:.4rem;font-family:sans-serif}
+#pr-toolbar button{padding:.55rem 1.1rem;border-radius:6px;font-weight:bold;border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);font-size:.85rem;letter-spacing:.02em;width:100%}
+#pr-toolbar button.pr-admin{background:#2b6cb0;color:#fff}
+#pr-toolbar button.pr-logout{background:#c53030;color:#fff}
+#pr-toolbar button.pr-admin[hidden]{display:none}
+#pr-toolbar .pr-version{color:#aaa;font-size:.7rem;letter-spacing:.03em;user-select:none}
+</style>
+<div id="pr-toolbar">
+<button id="pr-admin-btn" class="pr-admin" type="button" hidden>Admin</button>
+<button id="pr-logout-btn" class="pr-logout" type="button">Deconnexion</button>
+<span class="pr-version">MainGate 0.1</span>
+</div>
+<script>
+function prNavigate(url){
+  fetch(url,{credentials:"same-origin"}).then(function(r){return r.text();}).then(function(text){
+    history.pushState({},"",url);
+    document.open();
+    document.write(text);
+    document.close();
+  }).catch(function(){window.location.href=url;});
+}
+var prAdminBtn=document.getElementById("pr-admin-btn");
+if(location.pathname.indexOf("/admin")===0){
+  prAdminBtn.textContent="MainGate";
+  prAdminBtn.hidden=false;
+  prAdminBtn.addEventListener("click",function(){prNavigate("/");});
+}else{
+  prAdminBtn.addEventListener("click",function(){prNavigate("/admin");});
+  fetch("/session-info",{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d&&d.is_admin){prAdminBtn.hidden=false;}}).catch(function(){});
+}
+document.getElementById("pr-logout-btn").addEventListener("click",function(){
+  fetch("/logout",{credentials:"same-origin"}).finally(function(){prNavigate("/login");});
+});
+</script>
+</body>';
+
+    # Infos de session pour la barre ci-dessus (admin ou non) — l'app
+    # d'auth vérifie elle-même le cookie, rien d'exposé sans session valide.
+    location = /session-info {
+        proxy_pass http://127.0.0.1:9000/session-info;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # Vérification interne du cookie de session (utilisée par auth_request
+    # ci-dessous) — jamais appelée directement depuis l'extérieur.
+    location = /internal-auth-check {
+        internal;
+        proxy_pass http://127.0.0.1:9000/check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    # Page de connexion (login/mot de passe) — pas de vérification d'auth ici,
+    # sinon on ne pourrait jamais se connecter. Limitée en débit contre le
+    # bruteforce. En-têtes anti-clickjacking + no-store : une page de login
+    # ne doit jamais être embarquée dans une iframe tierce, ni mise en cache.
+    location /login {
+        limit_req zone=login_limit burst=3 nodelay;
+        add_header X-Frame-Options "DENY" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:9000/login;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /logout {
+        proxy_pass http://127.0.0.1:9000/logout;
+        proxy_set_header Host $http_host;
+    }
+
+    # Interface admin (comptes, IP bannies, historique) — auth_app.py
+    # vérifie lui-même que la session est valide ET admin. Mêmes en-têtes
+    # défensifs que /login (page sensible, jamais en iframe, jamais en cache).
+    location /admin {
+        add_header X-Frame-Options "DENY" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:9000;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location @login_redirect {
+        add_header Clear-Site-Data '"cache", "cookies", "storage"' always;
+        return 302 $redirect_scheme://$http_host/login;
+    }
+
+    # Interface Fluidd (fichiers statiques) — protégée par le cookie de session
+    location / {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # WebSocket Moonraker — protégé
+    location /websocket {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${MOONRAKER_HOST}:${MOONRAKER_PORT}/websocket;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+
+    # API REST Moonraker — protégée. client_max_body_size relevé ici
+    # uniquement : c'est par ce chemin que passent les uploads de gcode,
+    # qui peuvent être volumineux (contrairement au reste du site).
+    location ~ ^/(printer|api|access|machine|server) {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        client_max_body_size 200M;
+        proxy_pass http://${MOONRAKER_HOST}:${MOONRAKER_PORT}$request_uri;
+    }
+
+    # Flux caméra — protégé
+    location /webcam/ {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${WEBCAM_HOST}:${WEBCAM_PORT}/;
+        proxy_buffering off;
+    }
+
+    location /webcam2/ {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${WEBCAM_HOST}:${WEBCAM_PORT}/;
+        proxy_buffering off;
+    }
+}
+
+server {
+    listen 81;
+    server_name _;
+
+    access_log /dev/stdout;
+    error_log  /dev/stderr;
+
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Host $http_host;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_types application/json text/css application/javascript;
+
+    client_max_body_size 1m;
+    proxy_read_timeout 3600s;
+
+    # Même auth, même backend Moonraker que fluidd — seule la racine de
+    # fichiers statiques change (Mainsail au lieu de Fluidd).
+    root /usr/share/nginx/mainsail;
+    index index.html;
+
+    # Voir le commentaire équivalent dans le bloc port 80 (fluidd) plus haut :
+    # même barre MainGate, même contournement du service worker.
+    sub_filter_types text/html;
+    sub_filter_once on;
+    sub_filter '</body>' '<style>
+#pr-toolbar{position:fixed;bottom:12px;right:12px;z-index:999999;display:flex;flex-direction:column;align-items:flex-end;gap:.4rem;font-family:sans-serif}
+#pr-toolbar button{padding:.55rem 1.1rem;border-radius:6px;font-weight:bold;border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);font-size:.85rem;letter-spacing:.02em;width:100%}
+#pr-toolbar button.pr-admin{background:#2b6cb0;color:#fff}
+#pr-toolbar button.pr-logout{background:#c53030;color:#fff}
+#pr-toolbar button.pr-admin[hidden]{display:none}
+#pr-toolbar .pr-version{color:#aaa;font-size:.7rem;letter-spacing:.03em;user-select:none}
+</style>
+<div id="pr-toolbar">
+<button id="pr-admin-btn" class="pr-admin" type="button" hidden>Admin</button>
+<button id="pr-logout-btn" class="pr-logout" type="button">Deconnexion</button>
+<span class="pr-version">MainGate 0.1</span>
+</div>
+<script>
+function prNavigate(url){
+  fetch(url,{credentials:"same-origin"}).then(function(r){return r.text();}).then(function(text){
+    history.pushState({},"",url);
+    document.open();
+    document.write(text);
+    document.close();
+  }).catch(function(){window.location.href=url;});
+}
+var prAdminBtn=document.getElementById("pr-admin-btn");
+if(location.pathname.indexOf("/admin")===0){
+  prAdminBtn.textContent="MainGate";
+  prAdminBtn.hidden=false;
+  prAdminBtn.addEventListener("click",function(){prNavigate("/");});
+}else{
+  prAdminBtn.addEventListener("click",function(){prNavigate("/admin");});
+  fetch("/session-info",{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d&&d.is_admin){prAdminBtn.hidden=false;}}).catch(function(){});
+}
+document.getElementById("pr-logout-btn").addEventListener("click",function(){
+  fetch("/logout",{credentials:"same-origin"}).finally(function(){prNavigate("/login");});
+});
+</script>
+</body>';
+
+    location = /session-info {
+        proxy_pass http://127.0.0.1:9000/session-info;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location = /internal-auth-check {
+        internal;
+        proxy_pass http://127.0.0.1:9000/check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    location /login {
+        limit_req zone=login_limit burst=3 nodelay;
+        add_header X-Frame-Options "DENY" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:9000/login;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /logout {
+        proxy_pass http://127.0.0.1:9000/logout;
+        proxy_set_header Host $http_host;
+    }
+
+    location /admin {
+        add_header X-Frame-Options "DENY" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:9000;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location @login_redirect {
+        add_header Clear-Site-Data '"cache", "cookies", "storage"' always;
+        return 302 $redirect_scheme://$http_host/login;
+    }
+
+    location / {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /websocket {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${MOONRAKER_HOST}:${MOONRAKER_PORT}/websocket;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+
+    location ~ ^/(printer|api|access|machine|server) {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        client_max_body_size 200M;
+        proxy_pass http://${MOONRAKER_HOST}:${MOONRAKER_PORT}$request_uri;
+    }
+
+    location /webcam/ {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${WEBCAM_HOST}:${WEBCAM_PORT}/;
+        proxy_buffering off;
+    }
+
+    location /webcam2/ {
+        auth_request /internal-auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass http://${WEBCAM_HOST}:${WEBCAM_PORT}/;
+        proxy_buffering off;
+    }
+}

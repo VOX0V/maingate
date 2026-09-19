@@ -1,0 +1,11 @@
+# Secrets et config locale — ne jamais publier (identifiants, IP réseau)
+.env
+
+# Bytecode Python compilé — généré automatiquement à l'exécution
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers d'éditeurs / OS
+.DS_Store
+*.swp
