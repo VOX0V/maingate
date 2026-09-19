@@ -1,5 +1,7 @@
 name: Build and Publish Docker Image
 
+# Se déclenche à chaque push sur main qui touche au code de l'app, ou
+# manuellement depuis l'onglet Actions de GitHub (workflow_dispatch).
 on:
   push:
     branches: [main]
@@ -11,6 +13,9 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # "packages: write" est nécessaire pour que GITHUB_TOKEN (fourni
+    # automatiquement par GitHub, pas besoin d'en créer un) puisse publier
+    # l'image sur GitHub Container Registry (GHCR).
     permissions:
       contents: read
       packages: write
@@ -19,6 +24,16 @@ jobs:
       - name: Récupérer le code
         uses: actions/checkout@v4
 
+      # QEMU + Buildx permettent de construire une image pour une
+      # architecture différente de celle du runner GitHub (toujours amd64) :
+      # indispensable pour produire une image qui tourne nativement sur un
+      # Raspberry Pi (arm64), pas seulement sur un PC classique.
+      - name: Configurer QEMU (émulation multi-architecture)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Connexion à GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -26,10 +41,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Construire et publier l'image
+      - name: Construire et publier l'image (amd64 + arm64)
         uses: docker/build-push-action@v5
         with:
           context: ./maingate
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/vox0v/maingate:latest
