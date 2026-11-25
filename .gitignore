@@ -1,0 +1,17 @@
+# Secrets et config locale — ne jamais publier (identifiants, IP réseau)
+.env
+
+# Bytecode Python compilé — généré automatiquement à l'exécution
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers d'éditeurs / OS
+.DS_Store
+*.swp
+
+# Fichier de commandes local — ne pas publier
+0_maingate_cmd.txt
+
+# Données du conteneur (comptes, secret de session, historique)
+maingate/data/
